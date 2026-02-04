@@ -39,6 +39,13 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
 
         public void Initialize(int fontSize)
         {
+            // Dispose existing resources if re-initializing to prevent resource leaks
+            if (_tableTextFormat != null || _dwFactory != null)
+            {
+                Dispose(true);
+                _disposed = false;
+            }
+
             _dwFactory = new SharpDX.DirectWrite.Factory();
             _tableTextFormat = new SharpDX.DirectWrite.TextFormat(_dwFactory, "Consolas",
                 SharpDX.DirectWrite.FontWeight.Normal,

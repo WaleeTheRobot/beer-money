@@ -403,10 +403,8 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
                         long volumeAtPrice = barVolumes.GetAskVolumeForPrice(roundedPrice) + barVolumes.GetBidVolumeForPrice(roundedPrice);
                         if (volumeAtPrice > 0)
                         {
-                            if (_profileVolumes.ContainsKey(roundedPrice))
-                                _profileVolumes[roundedPrice] += volumeAtPrice;
-                            else
-                                _profileVolumes[roundedPrice] = volumeAtPrice;
+                            _profileVolumes.TryGetValue(roundedPrice, out long existingVolume);
+                            _profileVolumes[roundedPrice] = existingVolume + volumeAtPrice;
                         }
                     }
                 }
