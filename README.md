@@ -76,17 +76,30 @@ A configurable data display panel showing:
 
 - `Delta Efficiency = |Weighted Sum of Deltas| / Weighted Sum of |Deltas|`
 
-#### Exponential Decay Weighting
+#### Adaptive Exponential Decay
 
-The calculation uses exponential decay so that **newer bars have more influence** than older bars. This makes the metric more responsive to recent order flow changes while still considering historical context.
+The calculation uses exponential decay so that **newer bars have more influence** than older bars. The decay factor is calculated **dynamically based on the period** to ensure consistent weight distribution regardless of how many bars you use.
 
-- **Decay factor**: 0.85 (each older bar has 85% the weight of the next newer bar)
+**How it works:**
+
+- The oldest bar always has **5% the weight** of the newest bar
+- The decay factor adjusts automatically: `decayFactor = 0.05^(1/(period-1))`
+- This keeps the weight distribution proportionally the same for any period
+
+| Period  | Decay Factor | Last Quarter Weight |
+| ------- | ------------ | ------------------- |
+| 8 bars  | 0.65         | ~72%                |
+| 14 bars | 0.79         | ~72%                |
+| 20 bars | 0.86         | ~72%                |
+
+**Example with 14-bar period:**
+
 - **Newest bar**: weight = 1.0
-- **Second newest**: weight = 0.85
-- **Third newest**: weight = 0.72 (0.85²)
-- **And so on...**
+- **Middle bar** (bar 7): weight ≈ 0.22
+- **Oldest bar**: weight = 0.05
+- **Last quarter** (~4 bars) contributes ~72% of total weight
 
-In a 14-bar window, the oldest bar contributes only ~11% as much as the newest bar.
+This ensures the metric reflects current market conditions rather than stale history, and works consistently regardless of your period setting.
 
 #### Color Coding
 
@@ -98,21 +111,21 @@ The value is color-coded for quick visual assessment:
 
 #### Example
 
-If 4 bars have deltas of +100, -50, +80, -30 (oldest to newest):
+If 4 bars have deltas of +100, -50, +80, +120 (oldest to newest), with adaptive decay (oldest = 5% weight):
 
 | Bar        | Delta | Weight | Weighted Delta | Weighted | Delta |     |
 | ---------- | ----- | ------ | -------------- | -------- | ----- | --- |
-| 1 (oldest) | +100  | 0.61   | +61            | 61       |
-| 2          | -50   | 0.72   | -36            | 36       |
-| 3          | +80   | 0.85   | +68            | 68       |
-| 4 (newest) | -30   | 1.00   | -30            | 30       |
-| **Total**  |       |        | **+63**        | **195**  |
+| 1 (oldest) | +100  | 0.05   | +5             | 5        |
+| 2          | -50   | 0.18   | -9             | 9        |
+| 3          | +80   | 0.37   | +30            | 30       |
+| 4 (newest) | +120  | 1.00   | +120           | 120      |
+| **Total**  |       |        | **+146**       | **164**  |
 
-- Weighted net movement = |+63| = 63
-- Weighted total activity = 195
-- Efficiency = 63/195 = **32%** (yellow - mixed)
+- Weighted net movement = |+146| = 146
+- Weighted total activity = 164
+- Efficiency = 146/164 = **89%** (orange - trending)
 
-Without decay weighting, this would calculate as 38%. The decay gives more influence to the recent -30 delta, which pulls the efficiency slightly lower.
+The newest bar dominates, correctly identifying strong bullish momentum. The old +100 delta barely registers (weight 0.05).
 
 This metric is self-normalizing and works across any timeframe or tick size.
 
@@ -236,6 +249,33 @@ Before entering a trade, look for multiple confirming signals:
 - [ ] Delta efficiency color matches setup (trending vs choppy)?
 
 The more boxes checked, the higher the probability setup.
+
+### Delta Efficiency and Entry Timing
+
+Use delta efficiency to guide **how** you enter, not just **whether** to enter:
+
+#### Low Efficiency (Cyan, 0-30%) - Expect Chop
+
+- Order flow is choppy with deltas alternating directions
+- Price may still move in your direction, but it won't be clean
+- Expect grinding price action with frequent small retracements
+- **Don't chase** - wait for pullbacks to prior bars before entering
+
+#### Medium Efficiency (Yellow, 30-60%) - Mixed Quality
+
+- Some directional bias but not fully committed
+- Moderate chance of pullbacks within the move
+- Consider scaling in rather than full position at once
+- Be patient for better entries
+
+#### High Efficiency (Orange, 60-100%) - Clean Move
+
+- Strong directional order flow, deltas consistently one-sided
+- Price more likely to move cleanly with minimal retracement
+- More appropriate to enter on smaller pullbacks or chase
+- The move has conviction behind it
+
+**Key insight**: Low efficiency doesn't mean "don't trade the direction" - it means the move will be messy. Price can still travel 100 points with low efficiency, but it will chop around along the way. You'll likely get a better entry by waiting for those pullbacks rather than chasing.
 
 ### Target Setting
 

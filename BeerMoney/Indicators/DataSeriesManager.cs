@@ -12,10 +12,12 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
     public sealed class DataSeriesManager
     {
         /// <summary>
-        /// Decay factor for delta efficiency weighting (0.85 = each older bar has 85% the weight of the next newer).
-        /// Higher values (closer to 1.0) = more equal weighting, lower values = stronger recency bias.
+        /// Target weight ratio for the oldest bar relative to the newest bar.
+        /// The decay factor is calculated dynamically so that regardless of period,
+        /// the oldest bar always has this fraction of the newest bar's weight.
+        /// 0.05 = oldest bar has 5% the weight of newest bar.
         /// </summary>
-        private const double DeltaEfficiencyDecayFactor = 0.85;
+        private const double OldestBarWeightRatio = 0.05;
 
         private readonly int _period;
         private readonly int _biasSmoothing;
@@ -133,17 +135,23 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
             double weightedSumAbsDelta = 0;
             int n = _triggerBars.Count;
 
+            // Calculate decay factor dynamically based on bar count
+            // This ensures consistent weight distribution regardless of period:
+            // decayFactor^(n-1) = OldestBarWeightRatio
+            // So: decayFactor = OldestBarWeightRatio^(1/(n-1))
+            double decayFactor = n > 1 ? Math.Pow(OldestBarWeightRatio, 1.0 / (n - 1)) : 1.0;
+
             // Apply exponential decay weighting: newer bars have more influence
             // Index 0 = oldest, Index n-1 = newest
             // Weight for bar at index i = decayFactor^(n - 1 - i)
-            // Newest bar gets weight 1.0, each older bar gets decayFactor times less
+            // Newest bar gets weight 1.0, oldest bar gets weight ~OldestBarWeightRatio
             for (int i = 0; i < n; i++)
             {
                 var bar = _triggerBars[i];
                 if (bar != null)
                 {
                     // Calculate weight: newest bar (i = n-1) gets weight 1.0
-                    double weight = Math.Pow(DeltaEfficiencyDecayFactor, n - 1 - i);
+                    double weight = Math.Pow(decayFactor, n - 1 - i);
 
                     weightedSumDelta += bar.Delta * weight;
                     weightedSumAbsDelta += Math.Abs(bar.Delta) * weight;
