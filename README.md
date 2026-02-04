@@ -288,11 +288,11 @@ Use ATR as a guide for realistic targets:
 Consider volume profile levels as intermediate targets - if POC or VA boundary is closer than your ATR target, that may be a more realistic exit point.
 
 ## Installation
-
-1. Import the indicator into NinjaTrader
-2. Add to chart
-3. Configure Ticks Per Level to match your chart's volumetric settings
-4. Adjust thresholds based on the instrument's typical volume
+1. Download the latest release from https://github.com/WaleeTheRobot/beer-money/releases
+2. Import the indicator into NinjaTrader
+3. Add to chart
+4. Configure Ticks Per Level to match your chart's volumetric settings
+5. Adjust thresholds based on the instrument's typical volume
 
 ## Development
 
