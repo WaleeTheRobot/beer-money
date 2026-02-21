@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Windows.Media;
 using NinjaTrader.Gui.Chart;
 using NinjaTrader.NinjaScript.BarsTypes;
@@ -9,30 +8,21 @@ using SharpDX.Direct2D1;
 namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
 {
     /// <summary>
-    /// Renders diagonal imbalance glows on the chart.
+    /// Renders diagonal imbalance glows on the chart with volume-proportional scaling.
+    /// Both radius and opacity scale continuously based on actual volume at each level.
     /// </summary>
-    public sealed class ImbalanceRenderer
+    public sealed class ImbalanceRenderer : IDisposable
     {
-        // Glow effect constants
-        private const float GlowRadiusMultiplier = 1.5f;
-        private const float HighVolumeGlowMultiplier = 4.5f;
+        private const float MinGlowMultiplier = 1.0f;
+        private const float MaxGlowMultiplier = 4.5f;
         private const float MinGlowRadius = 6f;
-        private const float MinHighVolumeGlowRadius = 18f;
         private const float GlowCoreRadiusRatio = 0.5f;
         private const int GlowLayers = 3;
-        /// <summary>
-        /// Each outer glow layer expands by this fraction of base radius (0.4 = 40% per layer).
-        /// </summary>
         private const float GlowLayerExpansion = 0.4f;
-        /// <summary>
-        /// Opacity reduction factor per glow layer to create fade effect (0.7 = 70% of previous layer).
-        /// Combined with 1/layer index to create exponential falloff for natural glow appearance.
-        /// </summary>
         private const float GlowLayerOpacityFactor = 0.7f;
+        private const float MinWeight = 0.15f;
 
-        // Brush cache to reduce GC pressure during rendering
-        private readonly Dictionary<uint, SharpDX.Direct2D1.SolidColorBrush> _brushCache = new Dictionary<uint, SharpDX.Direct2D1.SolidColorBrush>();
-        private RenderTarget _cachedRenderTarget;
+        private readonly BrushCache _brushCache = new BrushCache();
 
         public void Render(
             RenderTarget renderTarget,
@@ -56,19 +46,15 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
             double levelSize = settings.TickSize * settings.TicksPerLevel;
             float halfBarWidth = (float)(chartControl.BarWidth / 2.0);
 
-            // Get visible time range from primary chart
             DateTime firstVisibleTime = times[primarySeries].GetValueAt(Math.Max(0, chartBars.FromIndex));
             DateTime lastVisibleTime = times[primarySeries].GetValueAt(Math.Min(chartBars.ToIndex, currentBars[primarySeries]));
 
-            // Find trigger bars within visible time range
             int firstTriggerIdx = barsArray[triggerSeries].GetBar(firstVisibleTime);
             int lastTriggerIdx = barsArray[triggerSeries].GetBar(lastVisibleTime);
 
-            // Clamp indices to valid range
             firstTriggerIdx = Math.Max(0, firstTriggerIdx);
             lastTriggerIdx = Math.Min(lastTriggerIdx, currentBars[triggerSeries]);
 
-            // Ensure we have a valid range to iterate
             if (firstTriggerIdx > lastTriggerIdx)
                 return;
 
@@ -79,8 +65,7 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
 
                 try
                 {
-                    var barVolumes = volumetricBars.Volumes[triggerBarIdx];
-                    if (barVolumes == null)
+                    if (volumetricBars.Volumes[triggerBarIdx] == null)
                         continue;
 
                     double barHigh = highs[triggerSeries].GetValueAt(triggerBarIdx);
@@ -94,7 +79,6 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
 
                     float barX = chartControl.GetXByBarIndex(chartBars, primaryBarIdx);
 
-                    // Use integer-based iteration to avoid floating-point precision issues
                     int startLevel = (int)Math.Floor(barLow / levelSize);
                     int endLevel = (int)Math.Ceiling(barHigh / levelSize);
 
@@ -103,12 +87,11 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
                         double price = level * levelSize;
                         RenderImbalancesAtPrice(
                             renderTarget, chartScale, barX, halfBarWidth, price, levelSize,
-                            barVolumes, settings);
+                            volumetricBars, triggerBarIdx, settings);
                     }
                 }
                 catch (ArgumentOutOfRangeException ex)
                 {
-                    // Bar index out of range - expected during chart updates, log with context for debugging
                     logError?.Invoke($"ImbalanceRenderer index out of range at bar {triggerBarIdx} (range: {firstTriggerIdx}-{lastTriggerIdx}): {ex.Message}");
                 }
                 catch (Exception ex)
@@ -138,12 +121,14 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
             float halfBarWidth,
             double price,
             double levelSize,
-            dynamic barVolumes,
+            VolumetricBarsType volumetricBars,
+            int barIndex,
             ImbalanceSettings settings)
         {
             double priceBelow = price - levelSize;
             double priceAbove = price + levelSize;
 
+            var barVolumes = volumetricBars.Volumes[barIndex];
             long askAtPrice = barVolumes.GetAskVolumeForPrice(price);
             long bidAtPrice = barVolumes.GetBidVolumeForPrice(price);
             long bidBelow = barVolumes.GetBidVolumeForPrice(priceBelow);
@@ -154,18 +139,14 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
 
             if (bullishImbalance)
             {
-                bool isHighVolume = askAtPrice >= settings.HighVolumeThreshold;
-                var color = isHighVolume ? settings.HighVolumeBullishColor : settings.BullishImbalanceColor;
-                DrawImbalanceGlow(renderTarget, chartScale, barX, halfBarWidth, price, isHighVolume,
-                    settings.ImbalanceOpacity, color);
+                DrawImbalanceGlow(renderTarget, chartScale, barX, halfBarWidth, price, askAtPrice,
+                    settings.ReferenceVolume, settings.ImbalanceOpacity, settings.BullishImbalanceColor);
             }
 
             if (bearishImbalance)
             {
-                bool isHighVolume = bidAtPrice >= settings.HighVolumeThreshold;
-                var color = isHighVolume ? settings.HighVolumeBearishColor : settings.BearishImbalanceColor;
-                DrawImbalanceGlow(renderTarget, chartScale, barX, halfBarWidth, price, isHighVolume,
-                    settings.ImbalanceOpacity, color);
+                DrawImbalanceGlow(renderTarget, chartScale, barX, halfBarWidth, price, bidAtPrice,
+                    settings.ReferenceVolume, settings.ImbalanceOpacity, settings.BearishImbalanceColor);
             }
         }
 
@@ -199,73 +180,47 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
             float barX,
             float halfBarWidth,
             double price,
-            bool isHighVolume,
+            long volume,
+            int referenceVolume,
             float imbalanceOpacity,
             System.Windows.Media.Brush colorBrush)
         {
-            // Clear brush cache if render target changed (device reset, etc.)
-            if (_cachedRenderTarget != renderTarget)
-            {
-                ClearBrushCache();
-                _cachedRenderTarget = renderTarget;
-            }
-
             float centerY = chartScale.GetYByValue(price);
 
-            float glowMultiplier = isHighVolume ? HighVolumeGlowMultiplier : GlowRadiusMultiplier;
-            float minRadius = isHighVolume ? MinHighVolumeGlowRadius : MinGlowRadius;
-            float baseRadius = Math.Max(halfBarWidth * glowMultiplier, minRadius);
+            // Continuous volume weight: small volumes get small glows, large volumes get large glows
+            float weight = Math.Max(MinWeight, Math.Min(1.0f, (float)volume / Math.Max(1, referenceVolume)));
+
+            float glowMultiplier = MinGlowMultiplier + weight * (MaxGlowMultiplier - MinGlowMultiplier);
+            float baseRadius = Math.Max(halfBarWidth * glowMultiplier, MinGlowRadius);
 
             var centerPoint = new SharpDX.Vector2(barX, centerY);
             var baseColor = ((System.Windows.Media.SolidColorBrush)colorBrush).Color;
 
-            // Draw multiple layers for glow effect (outer to inner)
+            // Floor the effective weight so minimum is always visible
+            float effectiveWeight = 0.4f + 0.6f * weight;
+
+            // Draw multiple layers for glow effect (outer to inner), opacity scaled by volume weight
             for (int i = GlowLayers; i >= 1; i--)
             {
                 float layerRadius = baseRadius * (1f + (i - 1) * GlowLayerExpansion);
-                float layerOpacity = imbalanceOpacity * (1f / i) * GlowLayerOpacityFactor;
+                float layerOpacity = imbalanceOpacity * effectiveWeight * (1f / i) * GlowLayerOpacityFactor;
 
-                var layerBrush = GetOrCreateBrush(renderTarget, baseColor.R, baseColor.G, baseColor.B, (byte)(255 * layerOpacity));
-                var ellipse = new SharpDX.Direct2D1.Ellipse(centerPoint, layerRadius, layerRadius);
+                var layerBrush = _brushCache.GetOrCreate(renderTarget, baseColor.R, baseColor.G, baseColor.B, (byte)(255 * layerOpacity));
+                var ellipse = new Ellipse(centerPoint, layerRadius, layerRadius);
                 renderTarget.FillEllipse(ellipse, layerBrush);
             }
 
-            // Draw bright center core
+            // Draw bright center core, also scaled by weight
             float coreRadius = baseRadius * GlowCoreRadiusRatio;
-            var coreBrush = GetOrCreateBrush(renderTarget, baseColor.R, baseColor.G, baseColor.B, (byte)(255 * imbalanceOpacity));
-            var coreEllipse = new SharpDX.Direct2D1.Ellipse(centerPoint, coreRadius, coreRadius);
+            float coreOpacity = imbalanceOpacity * effectiveWeight;
+            var coreBrush = _brushCache.GetOrCreate(renderTarget, baseColor.R, baseColor.G, baseColor.B, (byte)(255 * coreOpacity));
+            var coreEllipse = new Ellipse(centerPoint, coreRadius, coreRadius);
             renderTarget.FillEllipse(coreEllipse, coreBrush);
         }
 
-        private SharpDX.Direct2D1.SolidColorBrush GetOrCreateBrush(RenderTarget renderTarget, byte r, byte g, byte b, byte a)
-        {
-            // Create a unique key from RGBA values
-            uint key = ((uint)r << 24) | ((uint)g << 16) | ((uint)b << 8) | a;
-
-            if (!_brushCache.TryGetValue(key, out var brush))
-            {
-                brush = new SharpDX.Direct2D1.SolidColorBrush(renderTarget, new SharpDX.Color(r, g, b, a));
-                _brushCache[key] = brush;
-            }
-            return brush;
-        }
-
-        private void ClearBrushCache()
-        {
-            foreach (var brush in _brushCache.Values)
-            {
-                brush?.Dispose();
-            }
-            _brushCache.Clear();
-        }
-
-        /// <summary>
-        /// Disposes cached resources. Call when the renderer is no longer needed.
-        /// </summary>
         public void Dispose()
         {
-            ClearBrushCache();
-            _cachedRenderTarget = null;
+            _brushCache.Dispose();
         }
     }
 }

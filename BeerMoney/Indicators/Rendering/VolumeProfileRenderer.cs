@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BeerMoney.Core.Analysis.Results;
 using NinjaTrader.Gui.Chart;
 using SharpDX.Direct2D1;
@@ -8,9 +9,12 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
     /// <summary>
     /// Renders volume profile on the right side of the chart.
     /// </summary>
-    public sealed class VolumeProfileRenderer
+    public sealed class VolumeProfileRenderer : IDisposable
     {
         private const float ProfileRightMargin = 10f;
+
+        private readonly Dictionary<uint, SolidColorBrush> _brushCache = new Dictionary<uint, SolidColorBrush>();
+        private RenderTarget _cachedRenderTarget;
 
         public void Render(
             RenderTarget renderTarget,
@@ -21,6 +25,12 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
         {
             if (renderTarget == null || volumeProfile == null || !volumeProfile.IsValid || volumeProfile.PriceVolumes == null)
                 return;
+
+            if (_cachedRenderTarget != renderTarget)
+            {
+                ClearBrushCache();
+                _cachedRenderTarget = renderTarget;
+            }
 
             double levelSize = settings.TickSize * settings.TicksPerLevel;
 
@@ -48,33 +58,34 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
 
                 bool isInValueArea = price >= volumeProfile.VAL && price <= volumeProfile.VAH;
 
-                SharpDX.Color barColor = isInValueArea
-                    ? CreateDimmedColor(valueAreaColorValue, settings.ProfileOpacity)
-                    : CreateDimmedColor(profileColorValue, settings.ProfileOpacity * 0.5f);
-
-                using (var brush = new SharpDX.Direct2D1.SolidColorBrush(renderTarget, barColor))
+                byte r, g, b;
+                if (isInValueArea)
                 {
-                    var rect = new SharpDX.RectangleF(
-                        profileRight - barWidth,
-                        Math.Min(y1, y2),
-                        barWidth,
-                        barHeight);
-                    renderTarget.FillRectangle(rect, brush);
+                    r = (byte)(valueAreaColorValue.R * settings.ProfileOpacity);
+                    g = (byte)(valueAreaColorValue.G * settings.ProfileOpacity);
+                    b = (byte)(valueAreaColorValue.B * settings.ProfileOpacity);
                 }
+                else
+                {
+                    float dimOpacity = settings.ProfileOpacity * 0.5f;
+                    r = (byte)(profileColorValue.R * dimOpacity);
+                    g = (byte)(profileColorValue.G * dimOpacity);
+                    b = (byte)(profileColorValue.B * dimOpacity);
+                }
+
+                var brush = GetOrCreateBrush(renderTarget, r, g, b, 255);
+                var rect = new SharpDX.RectangleF(
+                    profileRight - barWidth,
+                    Math.Min(y1, y2),
+                    barWidth,
+                    barHeight);
+                renderTarget.FillRectangle(rect, brush);
             }
 
             // Draw POC, VAH, VAL lines
             DrawHorizontalLine(renderTarget, chartScale, volumeProfile.POC, profileLeft, profileRight, pocColorValue, 2f);
             DrawHorizontalLine(renderTarget, chartScale, volumeProfile.VAH, profileLeft, profileRight, valueAreaColorValue, 1f);
             DrawHorizontalLine(renderTarget, chartScale, volumeProfile.VAL, profileLeft, profileRight, valueAreaColorValue, 1f);
-        }
-
-        private SharpDX.Color CreateDimmedColor(System.Windows.Media.Color color, float opacity)
-        {
-            byte r = (byte)(color.R * opacity);
-            byte g = (byte)(color.G * opacity);
-            byte b = (byte)(color.B * opacity);
-            return new SharpDX.Color(r, g, b, (byte)255);
         }
 
         private void DrawHorizontalLine(
@@ -90,14 +101,35 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
                 return;
 
             float y = chartScale.GetYByValue(price);
-            using (var brush = new SharpDX.Direct2D1.SolidColorBrush(renderTarget,
-                new SharpDX.Color(color.R, color.G, color.B, (byte)255)))
+            var brush = GetOrCreateBrush(renderTarget, color.R, color.G, color.B, 255);
+            renderTarget.DrawLine(
+                new SharpDX.Vector2(left, y),
+                new SharpDX.Vector2(right, y),
+                brush, strokeWidth);
+        }
+
+        private SolidColorBrush GetOrCreateBrush(RenderTarget renderTarget, byte r, byte g, byte b, byte a)
+        {
+            uint key = ((uint)r << 24) | ((uint)g << 16) | ((uint)b << 8) | a;
+            if (!_brushCache.TryGetValue(key, out var brush))
             {
-                renderTarget.DrawLine(
-                    new SharpDX.Vector2(left, y),
-                    new SharpDX.Vector2(right, y),
-                    brush, strokeWidth);
+                brush = new SolidColorBrush(renderTarget, new SharpDX.Color(r, g, b, a));
+                _brushCache[key] = brush;
             }
+            return brush;
+        }
+
+        private void ClearBrushCache()
+        {
+            foreach (var brush in _brushCache.Values)
+                brush?.Dispose();
+            _brushCache.Clear();
+        }
+
+        public void Dispose()
+        {
+            ClearBrushCache();
+            _cachedRenderTarget = null;
         }
     }
 }
