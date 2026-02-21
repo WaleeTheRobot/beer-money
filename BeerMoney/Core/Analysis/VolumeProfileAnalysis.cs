@@ -88,7 +88,19 @@ namespace BeerMoney.Core.Analysis
             double val = sortedPrices[lowIndex];
             double vah = sortedPrices[highIndex];
 
-            return VolumeProfileResult.Create(poc, vah, val, priceVolumes, maxVolume, totalVolume);
+            // Compute top 5 high value nodes sorted by volume descending
+            var hvnList = new List<KeyValuePair<double, long>>(priceVolumes);
+            hvnList.Sort((a, b) =>
+            {
+                int cmp = b.Value.CompareTo(a.Value);
+                return cmp != 0 ? cmp : b.Key.CompareTo(a.Key);
+            });
+            int hvnCount = Math.Min(5, hvnList.Count);
+            var hvns = new List<HighValueNode>(hvnCount);
+            for (int i = 0; i < hvnCount; i++)
+                hvns.Add(new HighValueNode(hvnList[i].Key, hvnList[i].Value));
+
+            return VolumeProfileResult.Create(poc, vah, val, priceVolumes, maxVolume, totalVolume, hvns.AsReadOnly());
         }
     }
 }

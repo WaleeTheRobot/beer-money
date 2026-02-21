@@ -1,9 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.ComponentModel.DataAnnotations;
 using System.Windows.Media;
-using System.Xml.Serialization;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.Gui;
@@ -14,9 +11,9 @@ using NinjaTrader.NinjaScript.Indicators;
 using BeerMoney.Core.Analysis;
 using BeerMoney.Core.Analysis.Results;
 using BeerMoney.Core.Models;
+using BeerMoney.Core.Network;
+using BeerMoney.Core.Trading;
 using NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering;
-using SharpDX;
-using SharpDX.Direct2D1;
 
 namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
 {
@@ -30,11 +27,11 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
     }
 
     /// <summary>
-    /// Beer Money - VWAP indicator with bar painting based on order flow metrics.
-    /// 3 data series: Base (ATR), Bias (slow VWAP), Trigger (fast VWAP volumetric).
-    /// Bars are painted based on BarScore gradient with special divergent highlighting.
+    /// Beer Money - VWAP indicator with order flow analysis and dashboard WebSocket broadcast.
+    /// 4 data series: Primary, Base (ATR), Bias (slow VWAP), Trigger (fast VWAP).
+    /// On each completed trigger bar, computes all features and broadcasts via WebSocket.
     /// </summary>
-    public class BeerMoneyIndicator : Indicator
+    public partial class BeerMoneyIndicator : Indicator
     {
         // Data series indices
         private const int PrimarySeries = 0;
@@ -51,17 +48,39 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
         private int _lastTriggerBarCount = -1;
 
         // Bar painting colors for divergent bars only
-        private System.Windows.Media.Brush _divergentBullish;  // Positive delta + bearish bar (hidden accumulation)
-        private System.Windows.Media.Brush _divergentBearish;  // Negative delta + bullish bar (hidden distribution)
+        private Brush _divergentBullish;
+        private Brush _divergentBearish;
 
         // Volume profile
         private VolumeProfileResult _volumeProfile;
         private Dictionary<double, long> _profileVolumes;
 
+        // Per-bar value area (shared dictionary, reused per call)
+        private double _lastTriggerBarVah;
+        private double _lastTriggerBarVal;
+        private double _lastBiasBarVah;
+        private double _lastBiasBarVal;
+        private Dictionary<double, long> _barValueAreaVolumes;
+
         // Renderers
         private ImbalanceRenderer _imbalanceRenderer;
         private VolumeProfileRenderer _volumeProfileRenderer;
-        private DataTableRenderer _dataTableRenderer;
+        private BarValueAreaRenderer _barValueAreaRenderer;
+
+        // Feature computers
+        private EmaTracker _emaTracker;
+        private EnrichedFeatureComputer _enrichedComputer;
+        private double[] _lastEnrichedFeatures;
+
+        // Order flow metrics (dual timeframe)
+        private OrderFlowMetricsTracker _triggerMetrics;
+        private OrderFlowMetricsTracker _biasMetrics;
+
+        // Bar extraction
+        private VolumetricBarExtractor _barExtractor;
+
+        // Dashboard WebSocket server
+        private WebSocketServer _wsServer;
 
         // Initialization state
         private bool _isInitialized;
@@ -87,7 +106,7 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
 
         private void SetDefaults()
         {
-            Description = "Beer Money - VWAP with Order Flow Bar Painting";
+            Description = "Beer Money - VWAP with Order Flow Analysis + Dashboard";
             Name = "BeerMoney";
             Calculate = Calculate.OnEachTick;
             IsOverlay = true;
@@ -105,42 +124,46 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
             TicksPerLevel = 4;
             Period = 14;
             BiasSmoothing = 5;
+            ClusterLookback = 5;
+            ClusterBucketSize = 2.0;
+            EnableDashboard = true;
+            DashboardPort = 8422;
 
-            // Divergent colors - special highlighting for hidden activity
-            DivergentBullishColor = Brushes.Cyan;      // Hidden accumulation (positive delta, bearish bar)
-            DivergentBearishColor = Brushes.Magenta;   // Hidden distribution (negative delta, bullish bar)
+            ShowDivergentBars = true;
+            DivergentBullishColor = Brushes.Cyan;
+            DivergentBearishColor = Brushes.Magenta;
 
-            // Imbalance heatmap settings
             ShowImbalances = true;
-            ImbalanceRatio = 3.0;           // 300% ratio threshold
-            MinImbalanceVolume = 10;        // Minimum volume to consider
+            ImbalanceRatio = 3.0;
+            MinImbalanceVolume = 10;
             BullishImbalanceColor = Brushes.Green;
             BearishImbalanceColor = Brushes.Red;
             ImbalanceOpacity = 0.6f;
 
-            // High volume imbalance settings
-            HighVolumeThreshold = 100;      // Minimum volume at price level to use high volume color
-            HighVolumeBullishColor = Brushes.White;
-            HighVolumeBearishColor = Brushes.Orange;
+            ReferenceVolume = 150;
 
-            // Volume profile settings
             ShowVolumeProfile = true;
-            ProfileWidth = 150;             // Width in pixels
-            ValueAreaPercent = 70;          // 70% value area
+            ProfileWidth = 150;
+            ValueAreaPercent = 70;
             ProfileColor = Brushes.Yellow;
             ValueAreaColor = Brushes.CornflowerBlue;
             PocColor = Brushes.Red;
             ProfileOpacity = 0.6f;
 
-            // Data table settings
-            ShowDataTable = true;
-            DataTablePosition = TablePosition.BottomLeft;
-            TableFontSize = 12;
-            TableOffsetX = 0;
-            TableOffsetY = -15;
+            ShowBarValueArea = true;
+            BarValueAreaOpacity = 0.8f;
+            BarValueAreaPadding = 4;
+            BarVaColor = Brushes.CornflowerBlue;
+            BarPocColor = Brushes.Gold;
+
+            FastEmaPeriod = 5;
+            SlowEmaPeriod = 9;
+            ShowEmaLines = true;
 
             AddPlot(new Stroke(Brushes.Gold, 2), PlotStyle.Line, "BiasVwap");
             AddPlot(new Stroke(Brushes.Magenta, 1), PlotStyle.Line, "TriggerVwap");
+            AddPlot(new Stroke(Brushes.DodgerBlue, DashStyleHelper.Dash, 1), PlotStyle.Line, "SlowEMA");
+            AddPlot(new Stroke(Brushes.LimeGreen, DashStyleHelper.Dash, 1), PlotStyle.Line, "FastEMA");
         }
 
         private void ConfigureDataSeries()
@@ -148,75 +171,79 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
             BarsPeriodType basePeriodType = ConvertBarType(BaseBarsType);
             BarsPeriodType volumetricPeriodType = ConvertBarType(VolumetricBarsType);
 
-            AddDataSeries(basePeriodType, BaseTickSize);     // BaseSeries - ATR source
-            AddVolumetric(Instrument.FullName, volumetricPeriodType, BiasTickSize, VolumetricDeltaType.BidAsk, TicksPerLevel);   // BiasSeries - volumetric for VWAP + volume profile
-            AddVolumetric(Instrument.FullName, volumetricPeriodType, TriggerTickSize, VolumetricDeltaType.BidAsk, TicksPerLevel);  // TriggerSeries - volumetric
+            AddDataSeries(basePeriodType, BaseTickSize);
+            AddVolumetric(Instrument.FullName, volumetricPeriodType, BiasTickSize, VolumetricDeltaType.BidAsk, TicksPerLevel);
+            AddVolumetric(Instrument.FullName, volumetricPeriodType, TriggerTickSize, VolumetricDeltaType.BidAsk, TicksPerLevel);
         }
 
         private BarsPeriodType ConvertBarType(BarTypeOptions barType)
         {
             switch (barType)
             {
-                case BarTypeOptions.Minute:
-                    return BarsPeriodType.Minute;
-                case BarTypeOptions.Range:
-                    return BarsPeriodType.Range;
-                case BarTypeOptions.Second:
-                    return BarsPeriodType.Second;
-                case BarTypeOptions.Tick:
-                    return BarsPeriodType.Tick;
-                case BarTypeOptions.Volume:
-                    return BarsPeriodType.Volume;
-                default:
-                    return BarsPeriodType.Tick;
+                case BarTypeOptions.Minute: return BarsPeriodType.Minute;
+                case BarTypeOptions.Range: return BarsPeriodType.Range;
+                case BarTypeOptions.Second: return BarsPeriodType.Second;
+                case BarTypeOptions.Tick: return BarsPeriodType.Tick;
+                case BarTypeOptions.Volume: return BarsPeriodType.Volume;
+                default: return BarsPeriodType.Tick;
             }
         }
 
         private void Initialize()
         {
-            _dataSeriesManager = new DataSeriesManager(Period, BiasSmoothing, msg => Print(msg));
+            _dataSeriesManager = new DataSeriesManager(Period, BiasSmoothing, ClusterLookback, ClusterBucketSize,
+                SlowEmaPeriod, FastEmaPeriod, msg => Print(msg));
             _dataSeriesManager.Initialize();
 
-            // Freeze brushes for performance
             _divergentBullish = DivergentBullishColor.Clone();
             _divergentBullish.Freeze();
             _divergentBearish = DivergentBearishColor.Clone();
             _divergentBearish.Freeze();
 
-            // Initialize volume profile
             _profileVolumes = new Dictionary<double, long>();
+            _barValueAreaVolumes = new Dictionary<double, long>();
 
-            // Initialize renderers
             _imbalanceRenderer = new ImbalanceRenderer();
             _volumeProfileRenderer = new VolumeProfileRenderer();
-            _dataTableRenderer = new DataTableRenderer();
-            _dataTableRenderer.Initialize(TableFontSize);
+            _barValueAreaRenderer = new BarValueAreaRenderer();
 
-            // Validate volumetric data series configuration
+            _emaTracker = new EmaTracker(_ => { });
+            _emaTracker.SlowEmaPeriod = SlowEmaPeriod;
+            _emaTracker.FastEmaPeriod = FastEmaPeriod;
+            _enrichedComputer = new EnrichedFeatureComputer();
+
+            _triggerMetrics = new OrderFlowMetricsTracker(20);
+            _biasMetrics = new OrderFlowMetricsTracker(20);
+
+            _barExtractor = new VolumetricBarExtractor(
+                GetVolumetricBarsType,
+                () => Instrument.MasterInstrument.TickSize,
+                TicksPerLevel, ImbalanceRatio, MinImbalanceVolume);
+
+            if (EnableDashboard)
+            {
+                _wsServer = new WebSocketServer(DashboardPort, msg => Print(msg), Period * 2);
+                _wsServer.Start();
+            }
+
             ValidateVolumetricSeries();
-
             _isInitialized = true;
         }
 
         private void ValidateVolumetricSeries()
         {
-            // Validate that bias and trigger series are actually volumetric
             if (BarsArray.Length > BiasSeries)
             {
                 var biasVolumetric = BarsArray[BiasSeries].BarsType as VolumetricBarsType;
                 if (biasVolumetric == null)
-                {
-                    Print($"WARNING: BiasSeries (index {BiasSeries}) is not a VolumetricBarsType. Volume profile will not function correctly.");
-                }
+                    Print($"WARNING: BiasSeries (index {BiasSeries}) is not a VolumetricBarsType.");
             }
 
             if (BarsArray.Length > TriggerSeries)
             {
                 var triggerVolumetric = BarsArray[TriggerSeries].BarsType as VolumetricBarsType;
                 if (triggerVolumetric == null)
-                {
-                    Print($"WARNING: TriggerSeries (index {TriggerSeries}) is not a VolumetricBarsType. Imbalance rendering and volumetric analysis will not function correctly.");
-                }
+                    Print($"WARNING: TriggerSeries (index {TriggerSeries}) is not a VolumetricBarsType.");
             }
         }
 
@@ -224,19 +251,33 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
         {
             _isInitialized = false;
 
+            _wsServer?.Dispose();
+            _wsServer = null;
+
+            _emaTracker = null;
+            _enrichedComputer = null;
+            _lastEnrichedFeatures = null;
+            _barExtractor = null;
+
+            _triggerMetrics = null;
+            _biasMetrics = null;
+
             _dataSeriesManager?.Cleanup();
             _dataSeriesManager = null;
 
             _profileVolumes?.Clear();
             _profileVolumes = null;
+            _barValueAreaVolumes?.Clear();
+            _barValueAreaVolumes = null;
             _volumeProfile = null;
 
             _imbalanceRenderer?.Dispose();
             _imbalanceRenderer = null;
+            _volumeProfileRenderer?.Dispose();
             _volumeProfileRenderer = null;
 
-            _dataTableRenderer?.Dispose();
-            _dataTableRenderer = null;
+            _barValueAreaRenderer?.Dispose();
+            _barValueAreaRenderer = null;
         }
 
         protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
@@ -246,62 +287,40 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
             if (!_isInitialized || RenderTarget == null || ChartBars == null)
                 return;
 
-            // Render volume profile on the right side
+            float clampedProfileOpacity = Math.Max(0.05f, Math.Min(1.0f, ProfileOpacity));
+            float clampedImbalanceOpacity = Math.Max(0.05f, Math.Min(1.0f, ImbalanceOpacity));
+            float clampedBarVaOpacity = Math.Max(0.05f, Math.Min(1.0f, BarValueAreaOpacity));
+
             if (ShowVolumeProfile && _volumeProfileRenderer != null)
             {
                 var profileSettings = new VolumeProfileSettings(
-                    ProfileWidth,
-                    TicksPerLevel,
-                    Instrument.MasterInstrument.TickSize,
-                    ProfileOpacity,
-                    ProfileColor,
-                    ValueAreaColor,
-                    PocColor);
+                    ProfileWidth, TicksPerLevel, Instrument.MasterInstrument.TickSize,
+                    clampedProfileOpacity, ProfileColor, ValueAreaColor, PocColor);
                 _volumeProfileRenderer.Render(RenderTarget, chartControl, chartScale, _volumeProfile, profileSettings);
             }
 
-            // Render imbalances
             if (ShowImbalances && _imbalanceRenderer != null)
             {
                 var volumetricBars = GetVolumetricBarsType(TriggerSeries);
-                if (volumetricBars == null)
-                {
-                    // Skip imbalance rendering if volumetric data not available
-                    return;
-                }
+                if (volumetricBars == null) return;
+
                 var imbalanceSettings = new ImbalanceSettings(
-                    TicksPerLevel,
-                    Instrument.MasterInstrument.TickSize,
-                    ImbalanceRatio,
-                    MinImbalanceVolume,
-                    HighVolumeThreshold,
-                    ImbalanceOpacity,
-                    BullishImbalanceColor,
-                    BearishImbalanceColor,
-                    HighVolumeBullishColor,
-                    HighVolumeBearishColor);
+                    TicksPerLevel, Instrument.MasterInstrument.TickSize,
+                    ImbalanceRatio, MinImbalanceVolume, ReferenceVolume,
+                    clampedImbalanceOpacity, BullishImbalanceColor, BearishImbalanceColor);
                 _imbalanceRenderer.Render(
                     RenderTarget, chartControl, chartScale, ChartBars, volumetricBars,
                     BarsArray, PrimarySeries, TriggerSeries, imbalanceSettings,
                     CurrentBars, Highs, Lows, Times, msg => Print(msg));
             }
 
-            // Render data table last so it's on top
-            if (ShowDataTable && _dataTableRenderer != null && _dataSeriesManager != null)
+            if (ShowBarValueArea && _barValueAreaRenderer != null)
             {
-                var tableValues = new DataTableValues(
-                    _dataSeriesManager.BiasVwap,
-                    _dataSeriesManager.TriggerVwap,
-                    _dataSeriesManager.BaseAtr,
-                    _dataSeriesManager.DeltaEfficiency);
-                var tableSettings = new DataTableSettings(
-                    DataTablePosition,
-                    TableFontSize,
-                    TableOffsetX,
-                    TableOffsetY,
-                    ShowVolumeProfile,
-                    ProfileWidth);
-                _dataTableRenderer.Render(RenderTarget, chartControl, chartScale, tableValues, tableSettings);
+                _barValueAreaRenderer.Render(
+                    RenderTarget, chartControl, chartScale, ChartBars,
+                    BarsArray, PrimarySeries, TriggerSeries, CurrentBars, Times,
+                    clampedBarVaOpacity, (float)BarValueAreaPadding,
+                    BarVaColor, BarPocColor);
             }
         }
 
@@ -319,63 +338,168 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
 
         private void ProcessPrimarySeries()
         {
-            if (_dataSeriesManager == null)
-                return;
+            if (_dataSeriesManager == null) return;
 
             if (_dataSeriesManager.BiasVwap > 0)
                 Values[0][0] = _dataSeriesManager.BiasVwap;
             if (_dataSeriesManager.TriggerVwap > 0)
                 Values[1][0] = _dataSeriesManager.TriggerVwap;
+            if (ShowEmaLines && _emaTracker != null && _emaTracker.SlowEmaValue > 0)
+                Values[2][0] = _emaTracker.SlowEmaValue;
+            if (ShowEmaLines && _emaTracker != null && _emaTracker.FastEmaValue > 0)
+                Values[3][0] = _emaTracker.FastEmaValue;
 
-            // Paint using current trigger bar data
             PaintBar();
         }
 
         private void ProcessBaseSeries()
         {
-            if (CurrentBars[BaseSeries] < Period)
-                return;
+            if (CurrentBars[BaseSeries] < Period) return;
 
             int currentBar = CurrentBars[BaseSeries];
-            if (currentBar == _lastBaseBarCount)
-                return;
+            if (currentBar == _lastBaseBarCount) return;
             _lastBaseBarCount = currentBar;
 
-            var bar = ExtractBar(BaseSeries, 1);
+            var bar = _barExtractor.ExtractBar(BaseSeries, 1, Times, CurrentBars, Opens, Highs, Lows, Closes, Volumes);
             _dataSeriesManager.ProcessBaseBar(bar);
         }
 
         private void ProcessBiasSeries()
         {
-            if (CurrentBars[BiasSeries] < Period)
-                return;
+            if (CurrentBars[BiasSeries] < Period) return;
 
             int currentBar = CurrentBars[BiasSeries];
-            if (currentBar == _lastBiasBarCount)
-                return;
+            if (currentBar == _lastBiasBarCount) return;
             _lastBiasBarCount = currentBar;
 
-            var bar = ExtractBar(BiasSeries, 1);
+            var bar = _barExtractor.ExtractVolumetricBar(BiasSeries, 1, Times, CurrentBars, Opens, Highs, Lows, Closes, Volumes);
             _dataSeriesManager.ProcessBiasBar(bar, Closes[BiasSeries][0]);
 
-            // Calculate volume profile from rolling window of bias bars
+            if (_enrichedComputer != null)
+                _enrichedComputer.ProcessBiasBar(bar, _dataSeriesManager.BiasSlowEma, _dataSeriesManager.BaseAtr);
+
+            ComputeBarValueArea(BiasSeries, 1, out _lastBiasBarVah, out _lastBiasBarVal);
+            if (_biasMetrics != null && _dataSeriesManager.BaseAtr > 0)
+                _biasMetrics.ProcessBar(bar, _lastBiasBarVah, _lastBiasBarVal,
+                    _dataSeriesManager.BiasVwap, _dataSeriesManager.BaseAtr);
+
             if (ShowVolumeProfile)
-            {
                 CalculateVolumeProfile();
+        }
+
+        private void ProcessTriggerSeries()
+        {
+            if (CurrentBars[TriggerSeries] < Period) return;
+
+            int currentBar = CurrentBars[TriggerSeries];
+            bool isNewBar = currentBar != _lastTriggerBarCount;
+
+            if (isNewBar)
+            {
+                _lastTriggerBarCount = currentBar;
+
+                // Process completed bar (index 1) for rolling buffers, VWAP, features, and dashboard
+                if (CurrentBars[TriggerSeries] >= 1)
+                {
+                    var completedBar = _barExtractor.ExtractVolumetricBar(TriggerSeries, 1, Times, CurrentBars, Opens, Highs, Lows, Closes, Volumes);
+                    _dataSeriesManager.ProcessTriggerBar(completedBar, completedBar.Close, Closes[BiasSeries][0]);
+                    double atr = _dataSeriesManager.BaseAtr;
+
+                    ComputeBarValueArea(TriggerSeries, 1, out _lastTriggerBarVah, out _lastTriggerBarVal);
+                    int completedTriggerIdx = CurrentBars[TriggerSeries] - 1;
+                    if (_barValueAreaRenderer != null && completedTriggerIdx >= 0)
+                        _barValueAreaRenderer.CacheBar(completedTriggerIdx, completedBar.PointOfControl, _lastTriggerBarVah, _lastTriggerBarVal);
+
+                    if (_triggerMetrics != null && atr > 0)
+                        _triggerMetrics.ProcessBar(completedBar, _lastTriggerBarVah, _lastTriggerBarVal,
+                            _dataSeriesManager.TriggerVwap, atr);
+
+                    if (_emaTracker != null)
+                        _emaTracker.ProcessBar(completedBar, atr);
+
+                    double slowEma = _emaTracker?.SlowEmaValue ?? 0;
+                    _dataSeriesManager.ProcessCompletedTriggerBarFeatures(completedBar);
+
+                    // Compute enriched features
+                    if (_enrichedComputer != null && atr > 0)
+                    {
+                        int timeHHMMSS = ToTime(Times[TriggerSeries][1]);
+                        _lastEnrichedFeatures = _enrichedComputer.Compute(
+                            _dataSeriesManager.TriggerBars, completedBar,
+                            atr, _dataSeriesManager.TriggerDeltaEwm,
+                            _dataSeriesManager.ClusterTracker, timeHHMMSS);
+                    }
+
+                    // Broadcast to dashboard via WebSocket
+                    if (_wsServer != null && _wsServer.IsRunning && atr > 0)
+                    {
+                        string payload = DashboardPayloadBuilder.Build(
+                            completedBar, atr, slowEma,
+                            Times[TriggerSeries][1],
+                            _emaTracker, _dataSeriesManager,
+                            _lastEnrichedFeatures, _volumeProfile,
+                            _triggerMetrics?.CurrentMetrics,
+                            _biasMetrics?.CurrentMetrics);
+                        _wsServer.BroadcastBar(payload);
+                    }
+                }
+            }
+        }
+
+        private void ComputeBarValueArea(int seriesIndex, int barIndex, out double vah, out double val)
+        {
+            vah = 0;
+            val = 0;
+
+            var volumetricBars = GetVolumetricBarsType(seriesIndex);
+            if (volumetricBars == null)
+                return;
+
+            int volumeIndex = CurrentBars[seriesIndex] - barIndex;
+            if (volumeIndex < 0 || volumeIndex >= volumetricBars.Volumes.Length)
+                return;
+
+            var volumes = volumetricBars.Volumes[volumeIndex];
+            if (volumes == null)
+                return;
+
+            double tickSize = Instrument.MasterInstrument.TickSize;
+            double levelSize = tickSize * TicksPerLevel;
+            double barHigh = Highs[seriesIndex].GetValueAt(volumeIndex);
+            double barLow = Lows[seriesIndex].GetValueAt(volumeIndex);
+
+            _barValueAreaVolumes.Clear();
+            int startLevel = (int)Math.Floor(barLow / levelSize);
+            int endLevel = (int)Math.Ceiling(barHigh / levelSize);
+
+            for (int level = startLevel; level <= endLevel; level++)
+            {
+                double price = level * levelSize;
+                long vol = volumes.GetAskVolumeForPrice(price) + volumes.GetBidVolumeForPrice(price);
+                if (vol > 0)
+                    _barValueAreaVolumes[price] = vol;
+            }
+
+            if (_barValueAreaVolumes.Count > 0)
+            {
+                var result = VolumeProfileAnalysis.Calculate(_barValueAreaVolumes, 0.70);
+                if (result.IsValid)
+                {
+                    vah = result.VAH;
+                    val = result.VAL;
+                }
             }
         }
 
         private void CalculateVolumeProfile()
         {
             var volumetricBars = GetVolumetricBarsType(BiasSeries);
-            if (volumetricBars == null)
-                return;
+            if (volumetricBars == null) return;
 
             _profileVolumes.Clear();
             double tickSize = Instrument.MasterInstrument.TickSize;
             double levelSize = tickSize * TicksPerLevel;
 
-            // Aggregate volume across the rolling window (Period bars)
             int startBar = Math.Max(0, CurrentBars[BiasSeries] - Period);
             int endBar = CurrentBars[BiasSeries];
 
@@ -384,20 +508,17 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
                 try
                 {
                     var barVolumes = volumetricBars.Volumes[barIdx];
-                    if (barVolumes == null)
-                        continue;
+                    if (barVolumes == null) continue;
 
                     double barHigh = Highs[BiasSeries].GetValueAt(barIdx);
                     double barLow = Lows[BiasSeries].GetValueAt(barIdx);
 
-                    // Use integer-based iteration to avoid floating-point precision issues
                     int startLevel = (int)Math.Floor(barLow / levelSize);
                     int endLevel = (int)Math.Ceiling(barHigh / levelSize);
 
                     for (int level = startLevel; level <= endLevel; level++)
                     {
                         double price = level * levelSize;
-                        // Round to tick precision for consistent dictionary key lookup
                         double roundedPrice = RoundToTickPrecision(price, tickSize);
 
                         long volumeAtPrice = barVolumes.GetAskVolumeForPrice(roundedPrice) + barVolumes.GetBidVolumeForPrice(roundedPrice);
@@ -408,332 +529,36 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
                         }
                     }
                 }
-                catch (ArgumentOutOfRangeException)
-                {
-                    // Bar index out of range - expected during chart initialization
-                }
+                catch (ArgumentOutOfRangeException) { continue; }
             }
 
-            // Calculate POC, VAH, VAL
             _volumeProfile = VolumeProfileAnalysis.Calculate(_profileVolumes, ValueAreaPercent / 100.0);
         }
 
-        /// <summary>
-        /// Safely retrieves VolumetricBarsType for the specified series index.
-        /// </summary>
         private VolumetricBarsType GetVolumetricBarsType(int seriesIndex)
         {
-            if (seriesIndex < 0 || seriesIndex >= BarsArray.Length)
-                return null;
-
+            if (seriesIndex < 0 || seriesIndex >= BarsArray.Length) return null;
             return BarsArray[seriesIndex].BarsType as VolumetricBarsType;
         }
 
-        /// <summary>
-        /// Rounds a price to the nearest tick precision to ensure consistent dictionary key lookup.
-        /// </summary>
         private double RoundToTickPrecision(double price, double tickSize)
         {
             return Math.Round(price / tickSize) * tickSize;
         }
 
-        private void ProcessTriggerSeries()
-        {
-            if (CurrentBars[TriggerSeries] < Period)
-                return;
-
-            int currentBar = CurrentBars[TriggerSeries];
-            if (currentBar == _lastTriggerBarCount)
-                return;
-            _lastTriggerBarCount = currentBar;
-
-            // Extract current trigger bar (index 0) for both VWAP and painting
-            var bar = ExtractVolumetricBar(TriggerSeries, 0);
-            _dataSeriesManager.ProcessTriggerBar(bar, Closes[TriggerSeries][0], Closes[BiasSeries][0]);
-        }
-
         private void PaintBar()
         {
-            if (CurrentBar < 1)
-                return;
+            if (!ShowDivergentBars || CurrentBar < 1) return;
 
             var triggerBar = _dataSeriesManager?.CurrentTriggerBar;
-            if (triggerBar == null)
-                return;
+            if (triggerBar == null) return;
 
-            // Only paint divergent bars (hidden accumulation/distribution)
-            // Paint previous bar (index 1) since trigger data is one bar behind
             if (triggerBar.IsDivergent)
             {
-                // Positive delta + bearish bar = hidden accumulation (cyan)
-                // Negative delta + bullish bar = hidden distribution (magenta)
-                System.Windows.Media.Brush barColor = triggerBar.Delta > 0 ? _divergentBullish : _divergentBearish;
+                Brush barColor = triggerBar.Delta > 0 ? _divergentBullish : _divergentBearish;
                 BarBrushes[1] = barColor;
                 CandleOutlineBrushes[1] = barColor;
             }
         }
-
-        private BarData ExtractBar(int seriesIndex, int barIndex)
-        {
-            return new BarData(
-                Times[seriesIndex][barIndex],
-                CurrentBars[seriesIndex] - barIndex,
-                Opens[seriesIndex][barIndex],
-                Highs[seriesIndex][barIndex],
-                Lows[seriesIndex][barIndex],
-                Closes[seriesIndex][barIndex],
-                (long)Volumes[seriesIndex][barIndex]);
-        }
-
-        private BarData ExtractVolumetricBar(int seriesIndex, int barIndex)
-        {
-            long buyVolume = 0;
-            long sellVolume = 0;
-            long cumulativeDelta = 0;
-            long maxDelta = 0;
-            long minDelta = 0;
-            double pointOfControl = 0;
-
-            var volumetricBars = GetVolumetricBarsType(seriesIndex);
-            if (volumetricBars != null)
-            {
-                int volumeIndex = CurrentBars[seriesIndex] - barIndex;
-                if (volumeIndex >= 0 && volumeIndex < volumetricBars.Volumes.Length)
-                {
-                    var volumes = volumetricBars.Volumes[volumeIndex];
-                    if (volumes != null)
-                    {
-                        buyVolume = (long)volumes.TotalBuyingVolume;
-                        sellVolume = (long)volumes.TotalSellingVolume;
-                        cumulativeDelta = (long)volumes.CumulativeDelta;
-                        maxDelta = (long)volumes.MaxSeenDelta;
-                        minDelta = (long)volumes.MinSeenDelta;
-                        volumes.GetMaximumVolume(null, out pointOfControl);
-                    }
-                }
-            }
-
-            return new BarData(
-                Times[seriesIndex][barIndex],
-                CurrentBars[seriesIndex] - barIndex,
-                Opens[seriesIndex][barIndex],
-                Highs[seriesIndex][barIndex],
-                Lows[seriesIndex][barIndex],
-                Closes[seriesIndex][barIndex],
-                (long)Volumes[seriesIndex][barIndex],
-                buyVolume,
-                sellVolume,
-                cumulativeDelta,
-                maxDelta,
-                minDelta,
-                pointOfControl);
-        }
-
-        #region Properties
-
-        [NinjaScriptProperty]
-        [Display(Name = "Base Bars Type", Description = "The type of bars for the base data series (ATR)", Order = 1, GroupName = "Data Series")]
-        public BarTypeOptions BaseBarsType { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 10000)]
-        [Display(Name = "Base Period Size", Description = "Period size for base data series (e.g., ticks, seconds, range)", Order = 2, GroupName = "Data Series")]
-        public int BaseTickSize { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Volumetric Bars Type", Description = "The type of bars for the volumetric data series", Order = 3, GroupName = "Data Series")]
-        public BarTypeOptions VolumetricBarsType { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 10000)]
-        [Display(Name = "Bias Period Size", Description = "Period size for bias series (slower VWAP)", Order = 4, GroupName = "Data Series")]
-        public int BiasTickSize { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 10000)]
-        [Display(Name = "Trigger Period Size", Description = "Period size for trigger series (faster VWAP)", Order = 5, GroupName = "Data Series")]
-        public int TriggerTickSize { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 10)]
-        [Display(Name = "Ticks Per Level", Description = "Tick aggregation for volumetric data (must match chart)", Order = 6, GroupName = "Data Series")]
-        public int TicksPerLevel { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(5, 50)]
-        [Display(Name = "Period", Description = "Lookback period for ATR/VWAP", Order = 1, GroupName = "Parameters")]
-        public int Period { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 20)]
-        [Display(Name = "Bias Smoothing", Description = "EMA period for smoothing Bias VWAP (1=no smoothing)", Order = 2, GroupName = "Parameters")]
-        public int BiasSmoothing { get; set; }
-
-        [XmlIgnore]
-        [Display(Name = "Divergent Bullish", Description = "Color for hidden accumulation (positive delta + bearish bar)", Order = 1, GroupName = "Bar Colors")]
-        public System.Windows.Media.Brush DivergentBullishColor { get; set; }
-
-        [Browsable(false)]
-        public string DivergentBullishColorSerializable
-        {
-            get { return Serialize.BrushToString(DivergentBullishColor); }
-            set { DivergentBullishColor = Serialize.StringToBrush(value); }
-        }
-
-        [XmlIgnore]
-        [Display(Name = "Divergent Bearish", Description = "Color for hidden distribution (negative delta + bullish bar)", Order = 2, GroupName = "Bar Colors")]
-        public System.Windows.Media.Brush DivergentBearishColor { get; set; }
-
-        [Browsable(false)]
-        public string DivergentBearishColorSerializable
-        {
-            get { return Serialize.BrushToString(DivergentBearishColor); }
-            set { DivergentBearishColor = Serialize.StringToBrush(value); }
-        }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show Imbalances", Description = "Enable diagonal imbalance heatmap", Order = 1, GroupName = "Imbalances")]
-        public bool ShowImbalances { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1.5, 10.0)]
-        [Display(Name = "Imbalance Ratio", Description = "Minimum ratio for diagonal imbalance (e.g., 3.0 = 300%)", Order = 2, GroupName = "Imbalances")]
-        public double ImbalanceRatio { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 1000)]
-        [Display(Name = "Min Difference", Description = "Minimum volume difference between diagonal levels", Order = 3, GroupName = "Imbalances")]
-        public int MinImbalanceVolume { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0.1f, 1.0f)]
-        [Display(Name = "Opacity", Description = "Opacity of imbalance highlighting (0.1-1.0)", Order = 4, GroupName = "Imbalances")]
-        public float ImbalanceOpacity { get; set; }
-
-        [XmlIgnore]
-        [Display(Name = "Bullish Imbalance", Description = "Color for bullish diagonal imbalances", Order = 5, GroupName = "Imbalances")]
-        public System.Windows.Media.Brush BullishImbalanceColor { get; set; }
-
-        [Browsable(false)]
-        public string BullishImbalanceColorSerializable
-        {
-            get { return Serialize.BrushToString(BullishImbalanceColor); }
-            set { BullishImbalanceColor = Serialize.StringToBrush(value); }
-        }
-
-        [XmlIgnore]
-        [Display(Name = "Bearish Imbalance", Description = "Color for bearish diagonal imbalances", Order = 6, GroupName = "Imbalances")]
-        public System.Windows.Media.Brush BearishImbalanceColor { get; set; }
-
-        [Browsable(false)]
-        public string BearishImbalanceColorSerializable
-        {
-            get { return Serialize.BrushToString(BearishImbalanceColor); }
-            set { BearishImbalanceColor = Serialize.StringToBrush(value); }
-        }
-
-        [NinjaScriptProperty]
-        [Range(10, 10000)]
-        [Display(Name = "High Volume Threshold", Description = "Volume threshold for high volume imbalance color", Order = 7, GroupName = "Imbalances")]
-        public int HighVolumeThreshold { get; set; }
-
-        [XmlIgnore]
-        [Display(Name = "High Vol Bullish", Description = "Color for high volume bullish imbalances", Order = 8, GroupName = "Imbalances")]
-        public System.Windows.Media.Brush HighVolumeBullishColor { get; set; }
-
-        [Browsable(false)]
-        public string HighVolumeBullishColorSerializable
-        {
-            get { return Serialize.BrushToString(HighVolumeBullishColor); }
-            set { HighVolumeBullishColor = Serialize.StringToBrush(value); }
-        }
-
-        [XmlIgnore]
-        [Display(Name = "High Vol Bearish", Description = "Color for high volume bearish imbalances", Order = 9, GroupName = "Imbalances")]
-        public System.Windows.Media.Brush HighVolumeBearishColor { get; set; }
-
-        [Browsable(false)]
-        public string HighVolumeBearishColorSerializable
-        {
-            get { return Serialize.BrushToString(HighVolumeBearishColor); }
-            set { HighVolumeBearishColor = Serialize.StringToBrush(value); }
-        }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show Volume Profile", Description = "Enable volume profile on right side", Order = 1, GroupName = "Volume Profile")]
-        public bool ShowVolumeProfile { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(50, 400)]
-        [Display(Name = "Profile Width", Description = "Width of volume profile in pixels", Order = 2, GroupName = "Volume Profile")]
-        public int ProfileWidth { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(50, 90)]
-        [Display(Name = "Value Area %", Description = "Percentage of volume for value area (typically 70%)", Order = 3, GroupName = "Volume Profile")]
-        public int ValueAreaPercent { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0.1f, 1.0f)]
-        [Display(Name = "Profile Opacity", Description = "Opacity of volume profile bars (0.1-1.0)", Order = 4, GroupName = "Volume Profile")]
-        public float ProfileOpacity { get; set; }
-
-        [XmlIgnore]
-        [Display(Name = "Profile Color", Description = "Color for volume profile bars outside value area", Order = 5, GroupName = "Volume Profile")]
-        public System.Windows.Media.Brush ProfileColor { get; set; }
-
-        [Browsable(false)]
-        public string ProfileColorSerializable
-        {
-            get { return Serialize.BrushToString(ProfileColor); }
-            set { ProfileColor = Serialize.StringToBrush(value); }
-        }
-
-        [XmlIgnore]
-        [Display(Name = "Value Area Color", Description = "Color for volume profile bars inside value area", Order = 6, GroupName = "Volume Profile")]
-        public System.Windows.Media.Brush ValueAreaColor { get; set; }
-
-        [Browsable(false)]
-        public string ValueAreaColorSerializable
-        {
-            get { return Serialize.BrushToString(ValueAreaColor); }
-            set { ValueAreaColor = Serialize.StringToBrush(value); }
-        }
-
-        [XmlIgnore]
-        [Display(Name = "POC Color", Description = "Color for Point of Control", Order = 7, GroupName = "Volume Profile")]
-        public System.Windows.Media.Brush PocColor { get; set; }
-
-        [Browsable(false)]
-        public string PocColorSerializable
-        {
-            get { return Serialize.BrushToString(PocColor); }
-            set { PocColor = Serialize.StringToBrush(value); }
-        }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Show Data Table", Description = "Enable data table display", Order = 1, GroupName = "Data Table")]
-        public bool ShowDataTable { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "Position", Description = "Position of data table on chart", Order = 2, GroupName = "Data Table")]
-        public TablePosition DataTablePosition { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(8, 24)]
-        [Display(Name = "Font Size", Description = "Font size for data table", Order = 3, GroupName = "Data Table")]
-        public int TableFontSize { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(-500, 500)]
-        [Display(Name = "Offset X", Description = "Horizontal offset in pixels (positive = right)", Order = 4, GroupName = "Data Table")]
-        public int TableOffsetX { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(-500, 500)]
-        [Display(Name = "Offset Y", Description = "Vertical offset in pixels (positive = down)", Order = 5, GroupName = "Data Table")]
-        public int TableOffsetY { get; set; }
-
-        #endregion
     }
 }

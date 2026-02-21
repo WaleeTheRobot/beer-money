@@ -3,6 +3,23 @@ using System;
 namespace BeerMoney.Core.Models
 {
     /// <summary>
+    /// Imbalance analysis data for a single bar, grouped to avoid large parameter lists.
+    /// </summary>
+    public struct ImbalanceMetrics
+    {
+        public int BullishCount;
+        public int BearishCount;
+        public long BullishVolumeSum;
+        public long BearishVolumeSum;
+        public double BullishAvgPosition;
+        public double BearishAvgPosition;
+        public double MaxBullishPrice;
+        public long MaxBullishVolume;
+        public double MaxBearishPrice;
+        public long MaxBearishVolume;
+    }
+
+    /// <summary>
     /// Represents a single price bar with volume and volumetric order flow data.
     /// </summary>
     public sealed class BarData
@@ -23,6 +40,19 @@ namespace BeerMoney.Core.Models
         public long MinDelta { get; }
         public double PointOfControl { get; }
 
+        // Imbalance metrics
+        public int BullishImbalanceCount { get; }
+        public int BearishImbalanceCount { get; }
+        public long BullishImbVolumeSum { get; }
+        public long BearishImbVolumeSum { get; }
+        // Average imbalance position within bar range, normalized to [-1, +1]
+        public double BullishImbalanceAvgPosition { get; }
+        public double BearishImbalanceAvgPosition { get; }
+        public double MaxBullishImbPrice { get; }
+        public long MaxBullishImbVolume { get; }
+        public double MaxBearishImbPrice { get; }
+        public long MaxBearishImbVolume { get; }
+
         /// <summary>
         /// Bar delta (BuyVolume - SellVolume). Positive = buyers aggressive, negative = sellers aggressive.
         /// </summary>
@@ -41,7 +71,8 @@ namespace BeerMoney.Core.Models
             long cumulativeDelta = 0,
             long maxDelta = 0,
             long minDelta = 0,
-            double pointOfControl = 0)
+            double pointOfControl = 0,
+            ImbalanceMetrics imbalance = default)
         {
             Timestamp = timestamp;
             Index = index;
@@ -56,6 +87,16 @@ namespace BeerMoney.Core.Models
             MaxDelta = maxDelta;
             MinDelta = minDelta;
             PointOfControl = pointOfControl;
+            BullishImbalanceCount = imbalance.BullishCount;
+            BearishImbalanceCount = imbalance.BearishCount;
+            MaxBullishImbPrice = imbalance.MaxBullishPrice;
+            MaxBullishImbVolume = imbalance.MaxBullishVolume;
+            MaxBearishImbPrice = imbalance.MaxBearishPrice;
+            MaxBearishImbVolume = imbalance.MaxBearishVolume;
+            BullishImbVolumeSum = imbalance.BullishVolumeSum;
+            BearishImbVolumeSum = imbalance.BearishVolumeSum;
+            BullishImbalanceAvgPosition = imbalance.BullishAvgPosition;
+            BearishImbalanceAvgPosition = imbalance.BearishAvgPosition;
         }
 
         /// <summary>
@@ -109,28 +150,27 @@ namespace BeerMoney.Core.Models
         /// <summary>
         /// Combined bar score (-1 to +1).
         /// Delta determines direction (true bias), structure determines magnitude.
-        /// - Delta positive + high structure = strong bullish (+0.5 to +1)
-        /// - Delta positive + low structure = weak bullish (0 to +0.5) - accumulation
-        /// - Delta negative + low structure = strong bearish (-1 to -0.5)
-        /// - Delta negative + high structure = weak bearish (-0.5 to 0) - distribution
         /// </summary>
         public double BarScore
         {
             get
             {
                 if (DeltaBias > 0)
-                    return StructuralAlignment;           // 0 to +1 (bullish)
+                    return StructuralAlignment;
                 else if (DeltaBias < 0)
-                    return StructuralAlignment - 1.0;     // -1 to 0 (bearish)
+                    return StructuralAlignment - 1.0;
                 else
-                    return 0;                             // neutral (no delta)
+                    return 0;
             }
         }
 
         /// <summary>
+        /// Body as fraction of total range (0 = doji, 1 = full body). |Close - Open| / Range.
+        /// </summary>
+        public double BodyPercent => Range > 0 ? Math.Abs(Close - Open) / Range : 0;
+
+        /// <summary>
         /// True if delta diverges from bar direction (hidden buying/selling).
-        /// Positive delta + bearish bar = hidden accumulation (buyers absorbed selling).
-        /// Negative delta + bullish bar = hidden distribution (sellers absorbed buying).
         /// </summary>
         public bool IsDivergent => (Delta > 0 && IsBearish) || (Delta < 0 && IsBullish);
     }
