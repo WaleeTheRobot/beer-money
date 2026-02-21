@@ -16,7 +16,6 @@ namespace BeerMoney.Core.Network
     /// </summary>
     public sealed class WebSocketServer : IDisposable
     {
-        private const int BufferSize = 100;
         private const int ReceiveBufferSize = 1024;
 
         private readonly int _port;
@@ -25,17 +24,18 @@ namespace BeerMoney.Core.Network
         private CancellationTokenSource _cts;
         private readonly ConcurrentDictionary<Guid, ClientConnection> _clients;
         private readonly CircularBuffer<string> _barHistory;
+        private readonly object _historyLock = new object();
         private volatile bool _isRunning;
 
         public int ClientCount => _clients.Count;
         public bool IsRunning => _isRunning;
 
-        public WebSocketServer(int port = 8422, Action<string> log = null)
+        public WebSocketServer(int port = 8422, Action<string> log = null, int historySize = 28)
         {
             _port = port;
             _log = log ?? (_ => { });
             _clients = new ConcurrentDictionary<Guid, ClientConnection>();
-            _barHistory = new CircularBuffer<string>(BufferSize);
+            _barHistory = new CircularBuffer<string>(historySize);
         }
 
         public void Start()
@@ -105,7 +105,8 @@ namespace BeerMoney.Core.Network
         /// </summary>
         public void BroadcastBar(string json)
         {
-            _barHistory.Add(json);
+            lock (_historyLock)
+                _barHistory.Add(json);
 
             if (_clients.IsEmpty) return;
 
@@ -191,17 +192,23 @@ namespace BeerMoney.Core.Network
         {
             try
             {
-                // Send all buffered bars (holding send lock to serialize with broadcasts)
-                int count = _barHistory.Count;
-                _log($"[WS] Sending {count} history bars to client");
+                // Snapshot history under lock, then send (holding send lock to serialize with broadcasts)
+                string[] snapshot;
+                lock (_historyLock)
+                {
+                    int count = _barHistory.Count;
+                    snapshot = new string[count];
+                    for (int i = 0; i < count; i++)
+                        snapshot[i] = _barHistory[i];
+                }
+                _log($"[WS] Sending {snapshot.Length} history bars to client");
                 await client.SendLock.WaitAsync(ct);
                 try
                 {
-                    for (int i = 0; i < count; i++)
+                    for (int i = 0; i < snapshot.Length; i++)
                     {
-                        string bar = _barHistory[i];
-                        if (bar == null) continue;
-                        var bytes = Encoding.UTF8.GetBytes(bar);
+                        if (snapshot[i] == null) continue;
+                        var bytes = Encoding.UTF8.GetBytes(snapshot[i]);
                         await client.Socket.SendAsync(new ArraySegment<byte>(bytes),
                             WebSocketMessageType.Text, true, ct);
                     }
@@ -210,7 +217,7 @@ namespace BeerMoney.Core.Network
                 {
                     client.SendLock.Release();
                 }
-                _log($"[WS] History send complete ({count} bars)");
+                _log($"[WS] History send complete ({snapshot.Length} bars)");
 
                 // Keep connection alive, read until close
                 var buffer = new byte[ReceiveBufferSize];

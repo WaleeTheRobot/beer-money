@@ -90,7 +90,11 @@ namespace BeerMoney.Core.Analysis
 
             // Compute top 5 high value nodes sorted by volume descending
             var hvnList = new List<KeyValuePair<double, long>>(priceVolumes);
-            hvnList.Sort((a, b) => b.Value.CompareTo(a.Value));
+            hvnList.Sort((a, b) =>
+            {
+                int cmp = b.Value.CompareTo(a.Value);
+                return cmp != 0 ? cmp : b.Key.CompareTo(a.Key);
+            });
             int hvnCount = Math.Min(5, hvnList.Count);
             var hvns = new List<HighValueNode>(hvnCount);
             for (int i = 0; i < hvnCount; i++)

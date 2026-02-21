@@ -69,7 +69,7 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering
             if (renderTarget == null || chartBars == null || _cache.Count == 0)
                 return;
 
-            float halfBarWidth = (float)chartControl.BarWidth;
+            float halfBarWidth = (float)(chartControl.BarWidth / 2.0);
             double visibleMinPrice = chartScale.MinValue;
             double visibleMaxPrice = chartScale.MaxValue;
 

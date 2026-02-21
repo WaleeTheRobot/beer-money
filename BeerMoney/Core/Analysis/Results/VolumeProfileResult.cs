@@ -50,7 +50,7 @@ namespace BeerMoney.Core.Analysis.Results
             IReadOnlyList<HighValueNode> highValueNodes)
         {
             return new VolumeProfileResult(true, poc, vah, val,
-                new ReadOnlyDictionary<double, long>(priceVolumes), maxVolume, totalVolume,
+                new ReadOnlyDictionary<double, long>(new Dictionary<double, long>(priceVolumes)), maxVolume, totalVolume,
                 highValueNodes ?? EmptyHvns);
         }
 

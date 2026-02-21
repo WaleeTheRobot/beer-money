@@ -14,8 +14,6 @@ using BeerMoney.Core.Models;
 using BeerMoney.Core.Network;
 using BeerMoney.Core.Trading;
 using NinjaTrader.NinjaScript.Indicators.BeerMoney.Rendering;
-using SharpDX;
-using SharpDX.Direct2D1;
 
 namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
 {
@@ -224,7 +222,7 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
 
             if (EnableDashboard)
             {
-                _wsServer = new WebSocketServer(DashboardPort, msg => Print(msg));
+                _wsServer = new WebSocketServer(DashboardPort, msg => Print(msg), Period * 2);
                 _wsServer.Start();
             }
 
@@ -400,13 +398,11 @@ namespace NinjaTrader.NinjaScript.Indicators.BeerMoney
             {
                 _lastTriggerBarCount = currentBar;
 
-                var bar = _barExtractor.ExtractVolumetricBar(TriggerSeries, 0, Times, CurrentBars, Opens, Highs, Lows, Closes, Volumes);
-                _dataSeriesManager.ProcessTriggerBar(bar, Closes[TriggerSeries][0], Closes[BiasSeries][0]);
-
-                // Process completed bar (index 1) for features and dashboard
+                // Process completed bar (index 1) for rolling buffers, VWAP, features, and dashboard
                 if (CurrentBars[TriggerSeries] >= 1)
                 {
                     var completedBar = _barExtractor.ExtractVolumetricBar(TriggerSeries, 1, Times, CurrentBars, Opens, Highs, Lows, Closes, Volumes);
+                    _dataSeriesManager.ProcessTriggerBar(completedBar, completedBar.Close, Closes[BiasSeries][0]);
                     double atr = _dataSeriesManager.BaseAtr;
 
                     ComputeBarValueArea(TriggerSeries, 1, out _lastTriggerBarVah, out _lastTriggerBarVal);
